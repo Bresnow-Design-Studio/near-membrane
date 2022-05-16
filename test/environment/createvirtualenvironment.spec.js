@@ -1,3 +1,4 @@
+import { SUPPORTS_SHADOW_REALM } from '@locker/near-membrane-base';
 import createVirtualEnvironment from '@locker/near-membrane-dom';
 
 describe('createVirtualEnvironment', () => {
@@ -29,8 +30,11 @@ describe('createVirtualEnvironment', () => {
             });
             it('options object has keepAlive: true', () => {
                 const count = window.frames.length;
-                const env = createVirtualEnvironment(window, { keepAlive: true });
-                expect(window.frames.length).toBe(count + 1);
+                const env = createVirtualEnvironment(window, {
+                    globalObjectShape: window,
+                    keepAlive: true,
+                });
+                expect(window.frames.length).toBe(SUPPORTS_SHADOW_REALM ? count : count + 1);
                 expect(() => env.evaluate('')).not.toThrow();
             });
             it('options object has keepAlive: false', () => {

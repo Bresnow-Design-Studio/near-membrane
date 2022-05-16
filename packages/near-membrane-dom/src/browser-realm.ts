@@ -1,5 +1,6 @@
 import {
     assignFilteredGlobalDescriptorsFromPropertyDescriptorMap,
+    CallableEvaluate,
     createBlueConnector,
     createRedConnector,
     getFilteredGlobalOwnKeys,
@@ -8,6 +9,7 @@ import {
     Getter,
     Instrumentation,
     PropertyKeys,
+    SUPPORTS_SHADOW_REALM,
     VirtualEnvironment,
 } from '@locker/near-membrane-base';
 
@@ -31,10 +33,15 @@ const IFRAME_SANDBOX_ATTRIBUTE_VALUE = 'allow-same-origin allow-scripts';
 const ObjectCtor = Object;
 const TypeErrorCtor = TypeError;
 const { prototype: DocumentProto } = Document;
+const { bind: FunctionProtoBind } = Function.prototype;
 const { prototype: NodeProto } = Node;
 const { remove: ElementProtoRemove, setAttribute: ElementProtoSetAttribute } = Element.prototype;
 const { appendChild: NodeProtoAppendChild } = NodeProto;
-const { assign: ObjectAssign } = ObjectCtor;
+const {
+    assign: ObjectAssign,
+    create: ObjectCreate,
+    getOwnPropertyDescriptors: ObjectGetOwnPropertyDescriptors,
+} = ObjectCtor;
 // eslint-disable-next-line @typescript-eslint/naming-convention
 const { __lookupGetter__: ObjectProtoLookupGetter } = ObjectCtor.prototype as any;
 const { apply: ReflectApply } = Reflect;
@@ -59,9 +66,14 @@ const HTMLIFrameElementProtoContentWindowGetter: Getter = ReflectApply(
 const NodeProtoLastChildGetter: Getter = ReflectApply(ObjectProtoLookupGetter, NodeProto, [
     'lastChild',
 ])!;
+// @ts-ignore: Prevent cannot find name 'ShadowRealm' error.
+const ShadowRealmCtor = SUPPORTS_SHADOW_REALM ? ShadowRealm : undefined;
+const ShadowRealmProtoEvaluate: CallableEvaluate | undefined = ShadowRealmCtor?.prototype?.evaluate;
+const defaultGlobalOwnKeysRegistry = { __proto__: null };
 const docRef = document;
 
 let defaultGlobalOwnKeys: PropertyKeys | null = null;
+let defaultGlobalPropertyDescriptorMap: PropertyDescriptorMap | null = null;
 
 function createDetachableIframe(): HTMLIFrameElement {
     const iframe = ReflectApply(DocumentProtoCreateElement, docRef, [
@@ -166,4 +178,103 @@ function createIframeVirtualEnvironment(
     return env;
 }
 
-export default createIframeVirtualEnvironment;
+function createShadowRealmVirtualEnvironment(
+    globalObject: WindowProxy & typeof globalThis,
+    globalObjectShape: object | null,
+    providedOptions?: BrowserEnvironmentOptions
+): VirtualEnvironment {
+    if (typeof globalObject !== 'object' || globalObject === null) {
+        throw new TypeErrorCtor('Missing global object virtualization target.');
+    }
+    const {
+        distortionCallback,
+        endowments,
+        instrumentation,
+        // eslint-disable-next-line prefer-object-spread
+    } = ObjectAssign({ __proto__: null }, providedOptions);
+
+    // If a globalObjectShape has been explicitly specified, reset the
+    // defaultGlobalPropertyDescriptorMap to null. This will ensure that
+    // the provided globalObjectShape is used to re-create the cached
+    // defaultGlobalPropertyDescriptorMap.
+    if (globalObjectShape !== null) {
+        defaultGlobalPropertyDescriptorMap = null;
+    }
+    if (defaultGlobalPropertyDescriptorMap === null) {
+        let sourceShapeOrOneTimeWindow = globalObjectShape!;
+        let sourceIsIframe = false;
+        if (globalObjectShape === null) {
+            const oneTimeIframe = createDetachableIframe();
+            sourceShapeOrOneTimeWindow = ReflectApply(
+                HTMLIFrameElementProtoContentWindowGetter,
+                oneTimeIframe,
+                []
+            )!;
+            sourceIsIframe = true;
+        }
+        defaultGlobalOwnKeys = getFilteredGlobalOwnKeys(sourceShapeOrOneTimeWindow);
+        if (sourceIsIframe) {
+            ReflectApply(ElementProtoRemove, sourceShapeOrOneTimeWindow, []);
+        }
+        defaultGlobalPropertyDescriptorMap = {
+            __proto__: null,
+        } as unknown as PropertyDescriptorMap;
+        assignFilteredGlobalDescriptorsFromPropertyDescriptorMap(
+            defaultGlobalPropertyDescriptorMap,
+            ObjectGetOwnPropertyDescriptors(globalObject)
+        );
+        for (let i = 0, { length } = defaultGlobalOwnKeys; i < length; i += 1) {
+            defaultGlobalOwnKeysRegistry[defaultGlobalOwnKeys[i]] = true;
+        }
+        for (const key in defaultGlobalPropertyDescriptorMap) {
+            if (!(key in defaultGlobalOwnKeysRegistry)) {
+                delete defaultGlobalPropertyDescriptorMap[key];
+            }
+        }
+    }
+    const blueRefs = getCachedGlobalObjectReferences(globalObject);
+    // Create a new environment.
+    const env = new VirtualEnvironment({
+        blueConnector: createBlueConnector(globalObject),
+        distortionCallback,
+        instrumentation,
+        redConnector: createRedConnector(
+            ReflectApply(FunctionProtoBind, ShadowRealmProtoEvaluate, [new ShadowRealmCtor()])
+        ),
+    });
+    linkIntrinsics(env, globalObject);
+    // window
+    env.link('globalThis');
+    // Set globalThis.__proto__ in the sandbox to a proxy of
+    // globalObject.__proto__ and with this, the entire
+    // structure around window proto chain should be covered.
+    env.remapProto(globalObject, blueRefs.WindowProto);
+    let unsafeBlueDescMap: PropertyDescriptorMap = defaultGlobalPropertyDescriptorMap;
+    if (globalObject !== window) {
+        unsafeBlueDescMap = { __proto__: null } as unknown as PropertyDescriptorMap;
+        assignFilteredGlobalDescriptorsFromPropertyDescriptorMap(
+            unsafeBlueDescMap,
+            ObjectGetOwnPropertyDescriptors(globalObject)
+        );
+        for (const key in unsafeBlueDescMap) {
+            if (!(key in defaultGlobalOwnKeysRegistry)) {
+                delete unsafeBlueDescMap[key];
+            }
+        }
+    }
+    env.remapProperties(blueRefs.window, unsafeBlueDescMap);
+    if (endowments) {
+        const filteredEndowments: PropertyDescriptorMap = {};
+        assignFilteredGlobalDescriptorsFromPropertyDescriptorMap(filteredEndowments, endowments);
+        removeWindowDescriptors(filteredEndowments);
+        env.remapProperties(blueRefs.window, filteredEndowments);
+    }
+    // We remap `blueRefs.WindowPropertiesProto` to an empty object because it
+    // is "magical" in that it provides access to elements by id.
+    env.remapProto(blueRefs.WindowProto, ObjectCreate(blueRefs.EventTargetProto));
+    return env;
+}
+
+export default SUPPORTS_SHADOW_REALM
+    ? createShadowRealmVirtualEnvironment
+    : createIframeVirtualEnvironment;
